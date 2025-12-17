@@ -1,15 +1,23 @@
 <p align="center">
-  <h1 align="center">pacer</h1>
-  <p align="center">
-    <strong>Single-flight debounce/throttle for shell scripts</strong>
-  </p>
-  <p align="center">
-    <a href="#installation">Installation</a> •
-    <a href="#quick-start">Quick Start</a> •
-    <a href="#examples">Examples</a> •
-    <a href="#how-it-works">How It Works</a>
-  </p>
+  <img
+    src="./assets/pacer-logo.png"
+    alt="pacer logo"
+  />
 </p>
+
+<h1 align="center">pacer</h1>
+
+<p align="center">
+  <strong>Single-flight debounce/throttle for shell scripts</strong>
+</p>
+
+<p align="center">
+  <a href="#installation">Installation</a> •
+  <a href="#quick-start">Quick Start</a> •
+  <a href="#examples">Examples</a> •
+  <a href="#how-it-works">How It Works</a>
+</p>
+
 
 ---
 
@@ -369,6 +377,16 @@ Pacer uses filesystem-based coordination in `/tmp/pacer/`:
 | **Runner stamp** | PID + start time + lstart for safe process identification |
 
 The **smart skip** feature checks if another mode already executed since a pending timer was set. If so, the pending execution is skipped as redundant.
+
+### Debugging
+
+```bash
+# Enable debug logging to stderr
+PACER_DEBUG=1 pacer build 500 make
+
+# Write logs to file (useful for background processes)
+PACER_DEBUG=1 PACER_LOG_FILE=/tmp/pacer.log pacer build 500 make
+```
 
 ---
 

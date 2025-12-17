@@ -35,13 +35,17 @@ if ! command -v flock >/dev/null 2>&1; then
   exit 78
 fi
 
-: "${LOG_NAME:=pacer}"
-
+# Debug logging: set PACER_DEBUG=1 to enable, PACER_LOG_FILE to write to file
+# Logs go to stderr by default (won't pollute command output)
 _log() {
-  local level="${1:-log}"
+  [[ -n "${PACER_DEBUG:-}" ]] || return 0
+  local level="${1:-info}" ts
   shift || true
-  if command -v proclog >/dev/null 2>&1; then
-    proclog -n "$LOG_NAME" -l "$level" "$*"
+  ts="$(date '+%H:%M:%S')"
+  if [[ -n "${PACER_LOG_FILE:-}" ]]; then
+    printf '%s [%s] %s\n' "$ts" "$level" "$*" >> "$PACER_LOG_FILE"
+  else
+    printf '%s [pacer:%s] %s\n' "$ts" "$level" "$*" >&2
   fi
 }
 
@@ -336,6 +340,13 @@ EXIT CODES
   78  Bad usage
   79  Command killed due to --timeout
   70  OS/IO failure
+
+─────────────────────────────────────────────────────────────────────────────────
+ENVIRONMENT
+─────────────────────────────────────────────────────────────────────────────────
+
+  PACER_DEBUG=1           Enable debug logging to stderr
+  PACER_LOG_FILE=<path>   Write debug logs to file instead of stderr
 EOF
 }
 
@@ -732,6 +743,7 @@ runner_stamp="${_P[8]}"
 # ---------- execute (single-flight) ----------
 _exec_once() {
   _lock_run_blocking || return 70
+  _log info "exec: key=$key"
 
   local start
   start="$(_now_ms)"
@@ -829,6 +841,7 @@ if ((runner_alive)); then
   else
     [[ "$trailing" == "true" ]] && echo "1" >"$dirty"
   fi
+  _log info "queued: key=$key (runner pid=$pid)"
   _unlock_state
   exit 77
 fi
@@ -836,6 +849,7 @@ fi
 # Become runner: write pending + stamp
 echo "$$" >"$pend"
 _write_runner_stamp "$runner_stamp" "$$"
+_log info "runner: key=$key pid=$$ leading=$leading trailing=$trailing delay=${delay_ms}ms"
 _unlock_state
 
 # ---------- runner main ----------
