@@ -57,12 +57,12 @@ Pacer brings battle-tested async patterns to the shell.
 |---------|-------------|
 | **Debounce** | Wait for "quiet" before running (default) |
 | **Throttle** | Run at most once per interval |
-| **Single-flight** | Command never overlaps itself for the same ID |
+| **Single-flight** | Command never overlaps itself for the same ID (`flock`) |
 | **Cross-mode** | Throttle and debounce with same ID coordinate |
 | **Edge control** | Leading/trailing execution timing |
 | **Last-call-wins** | Always runs with the most recent arguments |
 | **Timeout** | Kill commands that run too long |
-| **Zero deps** | Pure bash (+ flock on macOS) |
+
 
 ---
 
@@ -71,7 +71,7 @@ Pacer brings battle-tested async patterns to the shell.
 ### Homebrew (macOS/Linux)
 
 ```bash
-brew install pacer
+brew install bradennapier/tap/pacer
 ```
 
 ### Manual
