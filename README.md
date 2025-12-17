@@ -386,6 +386,12 @@ PACER_DEBUG=1 pacer build 500 make
 
 # Write logs to file (useful for background processes)
 PACER_DEBUG=1 PACER_LOG_FILE=/tmp/pacer.log pacer build 500 make
+
+# Use custom state directory (useful for Docker, multi-user systems)
+PACER_STATE_DIR=/var/run/pacer pacer build 500 make
+
+# Check version
+pacer --version
 ```
 
 ---
