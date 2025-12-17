@@ -714,7 +714,6 @@ while [[ $# -gt 0 ]]; do
     --trailing) trailing="${2:-}"; shift 2 ;;
     --timeout)  timeout_ms="${2:-}"; shift 2 ;;
     --no-wait)  no_wait=1; shift ;;
-    -h|--help)  _usage; exit 0 ;;
     --) shift; break ;;
     -*) echo "Unknown option: $1" >&2; _usage >&2; exit 78 ;;
     *) break ;;
