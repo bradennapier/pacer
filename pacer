@@ -727,9 +727,11 @@ shift 2 2>/dev/null || true
 (($# > 0)) || { _usage >&2; exit 78; }
 [[ -n "$id" && -n "$delay_ms" ]] || { _usage >&2; exit 78; }
 
-# Validate delay_ms is a positive integer
-[[ "$delay_ms" =~ ^[0-9]+$ ]] || { echo "pacer: delay_ms must be a positive integer (got: '$delay_ms')" >&2; exit 78; }
-((delay_ms > 0)) || { echo "pacer: delay_ms must be greater than 0 (got: $delay_ms)" >&2; exit 78; }
+# Validate delay_ms is a positive integer greater than 0
+if [[ ! "$delay_ms" =~ ^[0-9]+$ ]] || ((delay_ms == 0)); then
+  echo "pacer: delay_ms must be a positive integer greater than 0 (got: '$delay_ms')" >&2
+  exit 78
+fi
 
 cmd=("$@")
 
@@ -746,12 +748,8 @@ fi
 
 # Create and validate state directory (security: prevent symlink attacks)
 mkdir -p "$_DIR" || exit 70
-if [[ -L "$_DIR" ]]; then
-  echo "pacer: security error: state directory is a symlink: $_DIR" >&2
-  exit 70
-fi
-if [[ ! -d "$_DIR" ]]; then
-  echo "pacer: state directory is not a directory: $_DIR" >&2
+if [[ -L "$_DIR" ]] || [[ ! -d "$_DIR" ]]; then
+  echo "pacer: security error: state directory must be a real directory (not a symlink): $_DIR" >&2
   exit 70
 fi
 
