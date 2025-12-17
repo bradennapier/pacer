@@ -28,7 +28,7 @@ Pacer brings these battle-tested patterns to the shell.
 
 > **Inspired by [TanStack Pacer](https://tanstack.com/pacer)** — the excellent async coordination library for JavaScript/>TypeScript. This project borrows naming conventions and conceptual patterns (debounce, throttle, leading/trailing edge) from TanStack's work. If you're building JS/TS applications, check out the original — it offers additional features like rate limiting, queueing, and batching that this shell implementation doesn't cover. 
     
-> **Tip:** tanstack pacer docs also have a useful [Which Utility Should I choose?](https://tanstack.com/pacer/latest/docs/guides/which-pacer-utility-should-i-choose) which can help when considering overlapping features with this tool as well
+
 
 ## Features
 
@@ -65,7 +65,7 @@ chmod +x /usr/local/bin/pacer
 ## Quick Start
 
 ```bash
-pacer <id> <delay_ms> <command> [args...]
+pacer [MODE] [OPTIONS] <id> <delay_ms> <command> [args...]
 ```
 
 | Argument | Description |
@@ -74,6 +74,31 @@ pacer <id> <delay_ms> <command> [args...]
 | `delay_ms` | Debounce quiet period or throttle interval in milliseconds |
 | `command` | The command to execute |
 | `args` | Arguments passed to command (supports spaces, quotes, etc.) |
+
+### Modes & Options
+
+```
+pacer [MODE] [OPTIONS] <id> <delay_ms> <command> [args...]
+
+Modes:
+  --debounce            Wait for quiet, then run (DEFAULT)
+  --throttle            Run immediately, rate-limit subsequent
+
+Options:
+  --leading  true|false   Run at START of burst (default: debounce=false, throttle=true)
+  --trailing true|false   Run at END of burst (default: true)
+  --timeout <ms>          Kill command if it runs longer than <ms> (exit code 79)
+  --no-wait              Exit immediately if busy, don't update state
+
+Operations:
+  --status [mode id]     Show state for all keys, or specific (mode, id)
+  --reset <mode> <id>    Kill runner and clear state
+  --reset-all <id>       Reset both debounce and throttle for <id>
+```
+
+## What Mode Should I Use?
+
+> **Tip:** tanstack pacer docs also have a useful [Which Utility Should I choose?](https://tanstack.com/pacer/latest/docs/guides/which-pacer-utility-should-i-choose) which can help when considering overlapping features with this tool as well
 
 ### When to Use Debounce
 
@@ -88,6 +113,9 @@ Debounce waits for "quiet" — the timer **resets on every call**. Use when you 
 ```bash
 # Search after user stops typing (300ms)
 pacer search 300 ./query.sh "$input"
+
+## debounce is default mode so synonymous with:
+# pacer --debounce search 500 ./query.sh "$input"
 
 # Prevent double-submit on button click
 pacer --leading true --trailing false submit 1000 ./handle-click.sh
@@ -145,26 +173,6 @@ Even with **same leading/trailing settings**, behavior differs:
 - "Wait for idle" → **Debounce**
 - "Steady heartbeat" → **Throttle**
 
-## Modes & Options
-
-```
-pacer [MODE] [OPTIONS] <id> <delay_ms> <command> [args...]
-
-Modes:
-  --debounce            Wait for quiet, then run (DEFAULT)
-  --throttle            Run immediately, rate-limit subsequent
-
-Options:
-  --leading  true|false   Run at START of burst (default: debounce=false, throttle=true)
-  --trailing true|false   Run at END of burst (default: true)
-  --timeout <ms>          Kill command if it runs longer than <ms> (exit code 79)
-  --no-wait              Exit immediately if busy, don't update state
-
-Operations:
-  --status [mode id]     Show state for all keys, or specific (mode, id)
-  --reset <mode> <id>    Kill runner and clear state
-  --reset-all <id>       Reset both debounce and throttle for <id>
-```
 
 ### Leading & Trailing Edge
 
@@ -254,11 +262,11 @@ done
 ```bash
 # sketchybar refresh — coordinate multiple event types
 yabai -m signal --add event=window_created \
-  action="pacer --throttle bar 100 sketchybar --reload"
+  action="pacer --throttle sketchybar_reload 100 sketchybar --reload"
 yabai -m signal --add event=window_destroyed \
-  action="pacer --throttle bar 100 sketchybar --reload"
+  action="pacer --throttle sketchybar_reload 100 sketchybar --reload"
 yabai -m signal --add event=window_title_changed \
-  action="pacer --debounce bar 1000 sketchybar --reload"
+  action="pacer --debounce sketchybar_reload 1000 sketchybar --reload"
 ```
 
 ### Timeouts
