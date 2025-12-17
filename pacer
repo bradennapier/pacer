@@ -1,0 +1,956 @@
+#!/usr/bin/env bash
+# pacer — single-flight debounce/throttle for noisy event sources (yabai/skhd/sketchybar/launchd)
+#
+# Inspired by TanStack Pacer (https://tanstack.com/pacer) — the async coordination
+# library for JS/TS by Tanner Linsley. This shell implementation adapts the naming
+# and concepts (debounce, throttle, leading/trailing edge) for cross-process CLI
+# use cases. TanStack Pacer offers additional features like rate limiting, queueing,
+# and batching that this implementation does not currently support.
+#
+# Key goals:
+# - Single-flight execution: command NEVER overlaps itself for the same <id>
+# - Cross-mode single-flight: throttle and debounce with same <id> share execution lock
+# - Smart skip: if one mode executes, the other mode's pending execution is skipped (already satisfied)
+# - Robust under storms: each mode has its own runner process; they coordinate via shared lock
+# - Last-call-wins argv: each mode tracks its own command; runner executes its mode's latest argv
+# - Ops controls: --status, --reset, --reset-all
+#
+# State dir: /tmp/pacer
+# Shared by <id>: run.lock, last_exec_ms
+# Per-mode (mode:id): state.lock, pending_pid, deadline_ms, window_end_ms, dirty, cmd, runner_stamp
+
+set -euo pipefail
+
+# Bash 4.3+ required for nameref (local -n)
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3))); then
+  echo "pacer: requires bash 4.3+ (found ${BASH_VERSION})" >&2
+  echo "  brew install bash" >&2
+  exit 78
+fi
+
+# flock required for locking (not in stock macOS)
+if ! command -v flock >/dev/null 2>&1; then
+  echo "pacer: requires flock (not found)" >&2
+  echo "  brew install flock" >&2
+  exit 78
+fi
+
+: "${LOG_NAME:=pacer}"
+
+_log() {
+  local level="${1:-log}"
+  shift || true
+  if command -v proclog >/dev/null 2>&1; then
+    proclog -n "$LOG_NAME" -l "$level" "$*"
+  fi
+}
+
+# _now_ms: milliseconds since epoch
+# macOS 15+ and GNU date support %N (nanoseconds), older macOS does not.
+# Fallback to seconds * 1000 if %N unavailable (less precision but functional).
+if date +%s%N >/dev/null 2>&1 && [[ "$(date +%N)" != "N" ]]; then
+  _now_ms() { echo "$(($(date +%s%N) / 1000000))"; }
+else
+  _now_ms() { echo "$(($(date +%s) * 1000))"; }
+fi
+
+# Periodic cleanup of stale state files (runs at most every 10 minutes)
+# Note: Uses $_DIR which must be defined before calling _maybe_cleanup
+_maybe_cleanup() {
+  local cleanup_marker="$_DIR/.last_cleanup"
+  local cleanup_interval=600        # 10 minutes between cleanups
+  local stale_threshold_min=60      # files older than 1 hour
+
+  [[ -d "$_DIR" ]] || return 0
+
+  local now_sec last_cleanup
+  now_sec="$(date +%s)"
+  last_cleanup="$(_read_or "$cleanup_marker" "0")"
+
+  # Skip if cleaned up recently
+  ((now_sec - last_cleanup < cleanup_interval)) && return 0
+
+  # Try to acquire cleanup lock (non-blocking, best-effort)
+  exec 7>"$_DIR/.cleanup.lock" 2>/dev/null || return 0
+  flock -n 7 || return 0
+
+  # Re-check after acquiring lock (another process may have just cleaned)
+  last_cleanup="$(_read_or "$cleanup_marker" "0")"
+  ((now_sec - last_cleanup < cleanup_interval)) && { flock -u 7; return 0; }
+
+  echo "$now_sec" >"$cleanup_marker"
+
+  # Find state files older than threshold
+  local f key pid pend_file
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+
+    # Extract key from filename (e.g., "debounce:foo" from "debounce:foo.cmd")
+    key="$(basename "$f" | sed -E 's/\.(state\.lock|pending_pid|deadline_ms|window_end_ms|dirty|cmd|runner_stamp|last_exec_ms|run\.lock)$//')"
+    [[ -z "$key" ]] && continue
+
+    # Skip internal files (cleanup marker, lock)
+    [[ "$key" == .* ]] && continue
+
+    # Check if there's a live runner for this key
+    pend_file="$_DIR/${key}.pending_pid"
+    if [[ -r "$pend_file" ]]; then
+      read -r pid <"$pend_file" 2>/dev/null || pid=""
+      if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        continue  # Runner alive, skip
+      fi
+    fi
+
+    # No live runner, file is old — remove it
+    rm -f "$f" 2>/dev/null || true
+  done < <(find "$_DIR" -maxdepth 1 -type f -mmin +"$stale_threshold_min" 2>/dev/null)
+
+  flock -u 7
+}
+
+_usage() {
+  cat <<'EOF'
+pacer — single-flight debounce/throttle runner (macOS-friendly)
+
+Usage:
+  pacer [MODE] [OPTIONS] <id> <delay_ms> <command> [args...]
+
+Modes:
+  --debounce            Debounce mode (DEFAULT)
+  --throttle            Throttle mode
+
+Options:
+  --leading  true|false   Run at the start of a burst?    (default: debounce=false, throttle=true)
+  --trailing true|false   Run at the end of a burst?      (default: true)
+  --timeout <ms>          Kill command if it runs longer than <ms> milliseconds.
+                          Exit code 79 on timeout. Useful for preventing hung commands.
+  --no-wait              If "active", exit immediately and DO NOT mutate timing/state (or command).
+                         Active means:
+                           - debounce: a runner exists OR (leading=true and within cooldown)
+                           - throttle: a runner exists OR within throttle window
+  --status [mode id]      Print state for (mode,id). If omitted, prints ALL keys.
+  --reset  <mode> <id>    Kill the runner (stamp-verified) and clear state for (mode,id)
+  --reset-all <id>        Reset both debounce:<id> and throttle:<id>
+  -h, --help              Show this help
+
+─────────────────────────────────────────────────────────────────────────────────
+WHEN TO USE DEBOUNCE
+─────────────────────────────────────────────────────────────────────────────────
+
+  Debounce waits for "quiet" — the timer RESETS on every call.
+  Use when you only care about the FINAL state after activity stops.
+
+  --leading false --trailing true (DEFAULT)
+    "Wait for silence, then act"
+    • Search input — query after typing stops
+    • Auto-save — save after editing pauses
+    • Config reload — reload after all writes finish
+
+  --leading true --trailing true
+    "Act now, then again after silence"
+    • Form validation — instant feedback + final check
+    • Preview — show immediately, update when done
+
+  --leading true --trailing false
+    "Act once, ignore until cooldown"
+    • Button clicks — prevent double-submit
+    • Notifications — show once, suppress duplicates
+
+─────────────────────────────────────────────────────────────────────────────────
+WHEN TO USE THROTTLE
+─────────────────────────────────────────────────────────────────────────────────
+
+  Throttle guarantees max frequency — fixed windows, timer NEVER resets.
+  Use when you want PERIODIC updates during continuous activity.
+
+  --leading true --trailing true (DEFAULT)
+    "Act now, then periodically, then final"
+    • Scroll/drag — instant feedback + steady updates + final position
+    • Live metrics — immediate reading + regular samples
+
+  --leading true --trailing false
+    "Act now, then at fixed intervals only"
+    • Progress polling — check immediately, then every N seconds
+    • Rate limiting — enforce max frequency, drop trailing
+
+  --leading false --trailing true
+    "Wait for interval, capture final state"
+    • Batch processing — collect events, process at end of window
+    • Aggregation — gather data, emit summary
+
+─────────────────────────────────────────────────────────────────────────────────
+THE KEY DIFFERENCE
+─────────────────────────────────────────────────────────────────────────────────
+
+  Even with SAME leading/trailing settings, behavior differs:
+
+                      DEBOUNCE              THROTTLE
+  Timer resets?       Yes, on every call    No, fixed windows
+  During burst:       Waits indefinitely    Fires at intervals
+  After burst:        Fires once            Fires once (if trailing)
+
+  Example: 10 rapid events over 500ms, delay=200ms
+
+    DEBOUNCE: Timer keeps resetting → fires ONCE at 700ms (after quiet)
+    THROTTLE: Fixed 200ms windows → fires at 0ms, 200ms, 400ms, ~500ms
+
+  Rule of thumb:
+    • "Wait for idle" → DEBOUNCE
+    • "Steady heartbeat" → THROTTLE
+
+─────────────────────────────────────────────────────────────────────────────────
+LEADING vs TRAILING Edge
+─────────────────────────────────────────────────────────────────────────────────
+
+  LEADING (start of burst):
+    true  → Execute IMMEDIATELY on first call, then apply delay rules.
+    false → Wait for delay to expire before executing.
+
+  TRAILING (end of burst):
+    true  → Execute after the delay/window expires (captures final state).
+    false → No execution at the end — only leading edge runs.
+
+  Common Combinations:
+    --leading false --trailing true   (debounce default)
+      → Wait for silence, then run once with final args.
+      → Best for: search, auto-save, validation
+
+    --leading true --trailing true    (throttle default)
+      → Run immediately, then again at end of window if more calls came in.
+      → Best for: UI updates needing instant feedback + final state
+
+    --leading true --trailing false
+      → Run immediately, ignore all calls until cooldown expires.
+      → Best for: button click handlers, preventing double-submits
+
+    --leading false --trailing false
+      → Effectively a no-op (nothing ever runs). Don't use this.
+
+─────────────────────────────────────────────────────────────────────────────────
+VISUAL TIMELINE — Event Calls (x) vs Executions (▼)
+─────────────────────────────────────────────────────────────────────────────────
+
+  Events:  x  x  x  x  x                      x  x
+  Time:    |--|--|--|--|-----|-----|-----|-----|--|-----|
+                             ↑                          ↑
+                          delay_ms                   delay_ms
+
+  DEBOUNCE (leading=false, trailing=true):
+           x  x  x  x  x                      x  x
+           |--|--|--|--|-----|                |--|-----|
+                             ▼                         ▼
+           Resets timer on each call.      Runs after quiet period.
+
+  DEBOUNCE (leading=true, trailing=true):
+           x  x  x  x  x                      x  x
+           ▼--|--|--|--|-----|                ▼--|-----|
+                             ▼                         ▼
+           Runs immediately on first call, then again after quiet.
+
+  THROTTLE (leading=true, trailing=true):
+           x  x  x  x  x                      x  x
+           ▼--|--|--|--|-----|                ▼--|-----|
+                             ▼                         ▼
+           Runs at start of window, then at end if dirty.
+
+  THROTTLE (leading=true, trailing=false):
+           x  x  x  x  x                      x  x
+           ▼--|--|--|--|-----|                ▼--|-----|
+           Runs once per window, ignores trailing calls.
+
+─────────────────────────────────────────────────────────────────────────────────
+EXAMPLES
+─────────────────────────────────────────────────────────────────────────────────
+
+  # Window resize: update layout after user stops resizing (500ms quiet)
+  pacer --debounce resize 500 ./update_layout.sh
+
+  # Search input: query after user stops typing (300ms)
+  pacer search 300 ./run_search.sh "$query"
+
+  # Scroll events: update position at most every 100ms during scroll
+  pacer --throttle scroll 100 ./update_scroll_indicator.sh
+
+  # yabai space change: immediate feedback, then final state
+  pacer --throttle --leading true --trailing true space 200 ./refresh_bar.sh
+
+  # Prevent duplicate rapid clicks: run once, ignore for 1s
+  pacer --debounce --leading true --trailing false click 1000 ./handle_click.sh
+
+  # Config reload: wait for all writes to finish (debounce 2s)
+  pacer config-reload 2000 ./reload_config.sh
+
+  # Status bar refresh: immediate on first event, coalesce subsequent
+  pacer --throttle bar-refresh 150 sketchybar --reload
+
+  # Build with timeout: kill if build takes longer than 30s
+  pacer --timeout 30000 build 500 make
+
+  # API call with timeout: prevent hung requests
+  pacer --throttle --timeout 5000 api 1000 curl https://api.example.com
+
+─────────────────────────────────────────────────────────────────────────────────
+KEY BEHAVIORS
+─────────────────────────────────────────────────────────────────────────────────
+
+  Single-flight:
+    Command execution is guarded by a per-key run-lock held for the entire
+    runtime. The command NEVER overlaps itself for the same (mode,id).
+
+  Last-call-wins:
+    The runner always executes the MOST RECENT command+args provided.
+    Earlier calls' arguments are discarded if a newer call arrives.
+
+  --no-wait:
+    If a runner is active, exit immediately (code 76) without updating
+    any state. Useful for "fire and forget if not busy" patterns.
+
+  Namespacing & Cross-Mode Awareness:
+    Timing state is namespaced as "debounce:<id>" and "throttle:<id>".
+    However, RUN LOCK and LAST_EXEC_MS are shared by <id> alone:
+      - Using --debounce and --throttle with the same <id> will never
+        execute simultaneously (shared run lock).
+      - When one mode executes, pending executions in the OTHER mode are
+        automatically skipped if they would be redundant (smart skip).
+
+    Example: debounce schedules exec in 1s, but throttle executes at 100ms.
+    When debounce's timer expires, it sees throttle already ran and skips.
+    This prevents duplicate executions when mixing modes for the same task.
+
+─────────────────────────────────────────────────────────────────────────────────
+DEFAULTS
+─────────────────────────────────────────────────────────────────────────────────
+
+  pacer --debounce  => --leading false --trailing true
+  pacer --throttle  => --leading true  --trailing true
+  If MODE omitted, --debounce is assumed.
+
+─────────────────────────────────────────────────────────────────────────────────
+EXIT CODES
+─────────────────────────────────────────────────────────────────────────────────
+
+  0   Command executed (returns the command's exit code).
+  75  Busy acquiring state lock (short contention)
+  76  Skipped due to active window/runner (--no-wait)
+  77  Another runner already scheduled; state updated
+  78  Bad usage
+  79  Command killed due to --timeout
+  70  OS/IO failure
+EOF
+}
+
+# say pacer
+
+_DIR="/tmp/pacer"
+
+_key_paths() {
+  local key="$1"
+  local id="${key#*:}"  # extract id from "mode:id"
+  echo "$_DIR/${key}.state.lock"    # 0 — per-mode state lock
+  echo "$_DIR/${id}.run.lock"       # 1 — SHARED: single-flight execution per id
+  echo "$_DIR/${id}.last_exec_ms"   # 2 — SHARED: any exec updates this (cross-mode aware)
+  echo "$_DIR/${key}.pending_pid"   # 3 — per-mode: each mode can have its own runner
+  echo "$_DIR/${key}.deadline_ms"   # 4 — per-mode (debounce)
+  echo "$_DIR/${key}.window_end_ms" # 5 — per-mode (throttle)
+  echo "$_DIR/${key}.dirty"         # 6 — per-mode (throttle trailing request)
+  echo "$_DIR/${key}.cmd"           # 7 — per-mode: each runner uses its own command
+  echo "$_DIR/${key}.runner_stamp"  # 8 — per-mode: tracks this mode's runner
+}
+
+_read_or() {
+  local f="$1" d="$2" v=""
+  [[ -r "$f" ]] && read -r v <"$f" || true
+  echo "${v:-$d}"
+}
+
+_write_cmdfile_nul() {
+  local f="$1"
+  shift
+  : >"$f"
+  local a
+  for a in "$@"; do
+    printf '%s\0' "$a" >>"$f"
+  done
+}
+
+_read_cmdfile_nul_into_array() {
+  local f="$1"
+  local -n __out="$2"  # nameref (bash 4.3+) — safer than eval
+  __out=()
+  local x
+  while IFS= read -r -d '' x; do __out+=("$x"); done <"$f"
+}
+
+_cmd_preview() {
+  local f="$1"
+  [[ -r "$f" ]] || { echo "<none>"; return 0; }
+  local -a a=()
+  local x
+  while IFS= read -r -d '' x; do a+=("$x"); done <"$f"
+  ((${#a[@]} == 0)) && { echo "<empty>"; return 0; }
+  local n=$((${#a[@]} < 6 ? ${#a[@]} : 6))
+  local out="" i
+  for ((i = 0; i < n; i++)); do out+="${a[$i]} "; done
+  echo "${out% }"
+}
+
+_runner_lstart() {
+  ps -p "$1" -o lstart= 2>/dev/null | sed 's/^ *//'
+}
+
+_write_runner_stamp() {
+  # stamp:
+  #   line1 = pid
+  #   line2 = start_ms
+  #   line3 = ps lstart (PID-reuse safety)
+  local f="$1" pid="$2"
+  local start_ms lstart
+  start_ms="$(_now_ms)"
+  lstart="$(_runner_lstart "$pid")"
+  printf '%s\n%s\n%s\n' "$pid" "$start_ms" "$lstart" >"$f"
+}
+
+_read_runner_stamp_fields() {
+  # echoes: "pid|start_ms|lstart"
+  local f="$1"
+  [[ -r "$f" ]] || { echo "||"; return 0; }
+  local p s ls
+  p="$(sed -n '1p' "$f" 2>/dev/null | tr -d '\r' || true)"
+  s="$(sed -n '2p' "$f" 2>/dev/null | tr -d '\r' || true)"
+  ls="$(sed -n '3p' "$f" 2>/dev/null | tr -d '\r' || true)"
+  echo "${p}|${s}|${ls}"
+}
+
+# ---------- locking ----------
+_lock_state_fast() {
+  exec 9>"$state_lock" || return 70
+  flock -w 0.05 9 || return 75
+  return 0
+}
+_unlock_state() { flock -u 9 2>/dev/null || true; }
+
+_lock_run_blocking() {
+  exec 8>"$run_lock" || return 70
+  flock 8
+  return 0
+}
+_unlock_run() { flock -u 8 2>/dev/null || true; }
+
+_cleanup_pending_and_exit() {
+  local rc="${1:-0}"
+  exec 9>"$state_lock" 2>/dev/null || true
+  flock -w 0.2 9 2>/dev/null || true
+  rm -f "$pend" 2>/dev/null || true
+  rm -f "$runner_stamp" 2>/dev/null || true
+  _unlock_state
+  exit "$rc"
+}
+
+# ---------- ops: status/reset ----------
+_status_key() {
+  local key="$1"
+  mkdir -p "$_DIR" || exit 70
+
+  local state_lock run_lock ts pend deadline window_end dirty cmdfile runner_stamp
+  mapfile -t _P < <(_key_paths "$key")
+  state_lock="${_P[0]}"
+  run_lock="${_P[1]}"
+  ts="${_P[2]}"
+  pend="${_P[3]}"
+  deadline="${_P[4]}"
+  window_end="${_P[5]}"
+  dirty="${_P[6]}"
+  cmdfile="${_P[7]}"
+  runner_stamp="${_P[8]}"
+
+  exec 9>"$state_lock" 2>/dev/null || true
+  flock -w 0.2 9 2>/dev/null || true
+
+  local now last pid alive="no"
+  now="$(_now_ms)"
+  last="$(_read_or "$ts" "0")"
+  pid="$(_read_or "$pend" "")"
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then alive="yes"; fi
+
+  local stamp_fields stamp_pid stamp_start_ms stamp_lstart age_ms
+  stamp_fields="$(_read_runner_stamp_fields "$runner_stamp")"
+  stamp_pid="${stamp_fields%%|*}"
+  stamp_fields="${stamp_fields#*|}"
+  stamp_start_ms="${stamp_fields%%|*}"
+  stamp_lstart="${stamp_fields#*|}"
+
+  age_ms="-"
+  if [[ -n "$stamp_start_ms" ]] && [[ "$stamp_start_ms" =~ ^[0-9]+$ ]]; then
+    age_ms=$((now - stamp_start_ms))
+    ((age_ms < 0)) && age_ms=0
+  fi
+
+  local stamp_note
+  if [[ -n "$pid" ]] && [[ ! -r "$runner_stamp" ]]; then
+    stamp_note=" stamp=<missing>"
+  else
+    stamp_note=" stamp_pid=${stamp_pid:-"-"} age_ms=${age_ms} lstart='${stamp_lstart}'"
+  fi
+
+  _log info "status key=$key now_ms=$now last_exec_ms=$last pending_pid=${pid:-none} alive=$alive${stamp_note} cmd='$(_cmd_preview "$cmdfile")'"
+
+  if [[ "$key" == debounce:* ]]; then
+    _log info "status key=$key deadline_ms=$(_read_or "$deadline" "0")"
+  else
+    _log info "status key=$key window_end_ms=$(_read_or "$window_end" "0") dirty=$([[ -f "$dirty" ]] && echo 1 || echo 0)"
+  fi
+
+  _unlock_state
+}
+
+_status_all() {
+  mkdir -p "$_DIR" || exit 70
+
+  local -a keys=()
+  while IFS= read -r k; do
+    [[ -n "$k" ]] && keys+=("$k")
+  done < <(
+    find "$_DIR" -maxdepth 1 -type f \( \
+      -name '*.pending_pid' -o -name '*.last_exec_ms' -o -name '*.deadline_ms' -o -name '*.window_end_ms' -o -name '*.cmd' -o -name '*.runner_stamp' \
+    \) 2>/dev/null \
+      | sed 's#.*/##' \
+      | sed -E 's/\.(pending_pid|last_exec_ms|deadline_ms|window_end_ms|cmd|runner_stamp)$//' \
+      | grep -E '^(debounce|throttle):' \
+      | sort -u
+  )
+
+  if ((${#keys[@]} == 0)); then
+    echo "pacer: no state files found in $_DIR"
+    return 0
+  fi
+
+  local now
+  now="$(_now_ms)"
+
+  printf "%-28s %-6s %-8s %-14s %-14s %-12s %-7s %-10s %s\n" \
+    "KEY" "ALIVE" "PID" "LAST_EXEC_MS" "NEXT_AT_MS" "NEXT_IN_MS" "DIRTY" "AGE_MS" "CMD"
+  printf "%-28s %-6s %-8s %-14s %-14s %-12s %-7s %-10s %s\n" \
+    "----------------------------" "-----" "--------" "------------" "------------" "----------" "-----" "----------" "--------------------------"
+
+  local key last pid alive next_at next_in dirtyflag cmdprev deadline window_end age_ms
+  for key in "${keys[@]}"; do
+    mapfile -t _P < <(_key_paths "$key")
+    local ts="${_P[2]}"
+    local pend="${_P[3]}"
+    local deadline_f="${_P[4]}"
+    local window_f="${_P[5]}"
+    local dirty_f="${_P[6]}"
+    local cmd_f="${_P[7]}"
+    local stamp_f="${_P[8]}"
+
+    last="$(_read_or "$ts" "0")"
+    pid="$(_read_or "$pend" "")"
+    alive="no"
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && alive="yes"
+
+    if [[ "$key" == debounce:* ]]; then
+      deadline="$(_read_or "$deadline_f" "0")"
+      next_at="$deadline"
+      dirtyflag="-"
+    else
+      window_end="$(_read_or "$window_f" "0")"
+      next_at="$window_end"
+      dirtyflag=$([[ -f "$dirty_f" ]] && echo "1" || echo "0")
+    fi
+
+    # Convert next_at to next_in (ms from now), clamp to 0.
+    next_in="-"
+    if [[ -n "$next_at" ]] && [[ "$next_at" =~ ^[0-9]+$ ]] && [[ "$next_at" != "0" ]]; then
+      next_in=$((next_at - now))
+      ((next_in < 0)) && next_in=0
+    else
+      next_at="-"
+    fi
+
+    # age_ms from runner_stamp start_ms (line2)
+    local start_ms
+    start_ms="$(sed -n '2p' "$stamp_f" 2>/dev/null | tr -d '\r' || true)"
+    age_ms="-"
+    if [[ -n "$start_ms" ]] && [[ "$start_ms" =~ ^[0-9]+$ ]]; then
+      age_ms=$((now - start_ms))
+      ((age_ms < 0)) && age_ms=0
+    fi
+
+    cmdprev="$(_cmd_preview "$cmd_f")"
+
+    printf "%-28s %-6s %-8s %-14s %-14s %-12s %-7s %-10s %s\n" \
+      "$key" "$alive" "${pid:-"-"}" "$last" "$next_at" "$next_in" "$dirtyflag" "$age_ms" "$cmdprev"
+  done
+}
+
+
+_reset_key() {
+  local key="$1"
+  mkdir -p "$_DIR" || exit 70
+
+  local state_lock run_lock ts pend deadline window_end dirty cmdfile runner_stamp
+  mapfile -t _P < <(_key_paths "$key")
+  state_lock="${_P[0]}"
+  run_lock="${_P[1]}"
+  ts="${_P[2]}"
+  pend="${_P[3]}"
+  deadline="${_P[4]}"
+  window_end="${_P[5]}"
+  dirty="${_P[6]}"
+  cmdfile="${_P[7]}"
+  runner_stamp="${_P[8]}"
+
+  exec 9>"$state_lock" 2>/dev/null || true
+  flock -w 0.2 9 2>/dev/null || true
+
+  local pid=""
+  [[ -r "$pend" ]] && read -r pid <"$pend" || true
+
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    # Stamp-verified kill (PID reuse safe)
+    local stamped_pid stamped_start_ms stamped_lstart cur_lstart
+    stamped_pid="$(sed -n '1p' "$runner_stamp" 2>/dev/null | tr -d '\r' || true)"
+    stamped_start_ms="$(sed -n '2p' "$runner_stamp" 2>/dev/null | tr -d '\r' || true)"
+    stamped_lstart="$(sed -n '3p' "$runner_stamp" 2>/dev/null | tr -d '\r' || true)"
+    cur_lstart="$(_runner_lstart "$pid")"
+
+    local age_note=""
+    if [[ -n "$stamped_start_ms" ]] && [[ "$stamped_start_ms" =~ ^[0-9]+$ ]]; then
+      age_note=" age_ms=$(($(_now_ms) - stamped_start_ms))"
+    fi
+
+    if [[ "$stamped_pid" == "$pid" ]] && [[ -n "$stamped_lstart" ]] && [[ "$cur_lstart" == "$stamped_lstart" ]]; then
+      _log warn "reset: killing runner pid=$pid key=$key${age_note}"
+      kill "$pid" 2>/dev/null || true
+      sleep 0.1
+      kill -9 "$pid" 2>/dev/null || true
+    else
+      _log warn "reset: pid=$pid alive but stamp mismatch; not killing (safety)"
+    fi
+  fi
+
+  rm -f "$pend" "$deadline" "$window_end" "$dirty" "$ts" "$cmdfile" "$runner_stamp" 2>/dev/null || true
+  rm -f "$state_lock" 2>/dev/null || true
+  # NOTE: run_lock is shared across modes, don't delete it here
+  _unlock_state
+
+  _log info "reset: cleared key=$key"
+}
+
+# ---------- parse ops first ----------
+if [[ "${1:-}" == "--status" ]]; then
+  shift
+  if [[ $# -eq 0 ]]; then
+    _status_all
+    exit 0
+  fi
+  mode="${1:-}"
+  id="${2:-}"
+  [[ -n "$mode" && -n "$id" ]] || { echo "Usage: pacer --status [<debounce|throttle> <id>]" >&2; exit 78; }
+  _status_key "${mode}:${id}"
+  exit 0
+fi
+
+if [[ "${1:-}" == "--reset" ]]; then
+  shift
+  mode="${1:-}"
+  id="${2:-}"
+  [[ -n "$mode" && -n "$id" ]] || { echo "Usage: pacer --reset <debounce|throttle> <id>" >&2; exit 78; }
+  _reset_key "${mode}:${id}"
+  exit 0
+fi
+
+if [[ "${1:-}" == "--reset-all" ]]; then
+  shift
+  id="${1:-}"
+  [[ -n "$id" ]] || { echo "Usage: pacer --reset-all <id>" >&2; exit 78; }
+  _reset_key "debounce:${id}"
+  _reset_key "throttle:${id}"
+  exit 0
+fi
+
+# ---------- parse mode/options ----------
+mode="debounce"
+leading=""
+trailing=""
+no_wait=0
+timeout_ms=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --debounce) mode="debounce"; shift ;;
+    --throttle) mode="throttle"; shift ;;
+    --leading)  leading="${2:-}"; shift 2 ;;
+    --trailing) trailing="${2:-}"; shift 2 ;;
+    --timeout)  timeout_ms="${2:-}"; shift 2 ;;
+    --no-wait)  no_wait=1; shift ;;
+    -h|--help)  _usage; exit 0 ;;
+    --) shift; break ;;
+    -*) echo "Unknown option: $1" >&2; _usage >&2; exit 78 ;;
+    *) break ;;
+  esac
+done
+
+id="${1:-}"
+delay_ms="${2:-}"
+shift 2 2>/dev/null || true
+(($# > 0)) || { _usage >&2; exit 78; }
+[[ -n "$id" && -n "$delay_ms" ]] || { _usage >&2; exit 78; }
+
+cmd=("$@")
+
+# defaults per mode
+if [[ -z "$leading" ]]; then
+  [[ "$mode" == "throttle" ]] && leading="true" || leading="false"
+fi
+if [[ -z "$trailing" ]]; then
+  trailing="true"
+fi
+[[ "$leading" == "true" || "$leading" == "false" ]] || { echo "--leading must be true|false" >&2; exit 78; }
+[[ "$trailing" == "true" || "$trailing" == "false" ]] || { echo "--trailing must be true|false" >&2; exit 78; }
+[[ -z "$timeout_ms" || "$timeout_ms" =~ ^[0-9]+$ ]] || { echo "--timeout must be a positive integer (milliseconds)" >&2; exit 78; }
+
+mkdir -p "$_DIR" || exit 70
+
+# Periodic cleanup (best-effort, non-blocking)
+_maybe_cleanup
+
+key="${mode}:${id}"
+
+# files
+mapfile -t _P < <(_key_paths "$key")
+state_lock="${_P[0]}"
+run_lock="${_P[1]}"
+ts="${_P[2]}"
+pend="${_P[3]}"
+deadline="${_P[4]}"
+window_end="${_P[5]}"
+dirty="${_P[6]}"
+cmdfile="${_P[7]}"
+runner_stamp="${_P[8]}"
+
+# ---------- execute (single-flight) ----------
+_exec_once() {
+  _lock_run_blocking || return 70
+
+  local start
+  start="$(_now_ms)"
+
+  exec 9>"$state_lock" || { _unlock_run; return 70; }
+  flock 9
+  echo "$start" >"$ts"
+  if [[ "$mode" == "throttle" ]]; then
+    echo "$((start + delay_ms))" >"$window_end"
+  fi
+  _unlock_state
+
+  [[ -r "$cmdfile" ]] || { _log error "missing cmdfile for key=$key ($cmdfile)"; _unlock_run; return 70; }
+
+  local -a run_cmd=()
+  _read_cmdfile_nul_into_array "$cmdfile" run_cmd
+  ((${#run_cmd[@]} == 0)) && { _log error "empty cmdfile for key=$key"; _unlock_run; return 70; }
+
+  local rc=0
+  if [[ -n "$timeout_ms" ]] && ((timeout_ms > 0)); then
+    # Run command with timeout
+    local timeout_sec
+    timeout_sec="$(awk "BEGIN { printf \"%.3f\", $timeout_ms/1000 }")"
+
+    # Run in background and wait with timeout
+    "${run_cmd[@]}" &
+    local cmd_pid=$!
+
+    local elapsed=0
+    local check_interval=100  # ms
+    while kill -0 "$cmd_pid" 2>/dev/null; do
+      if ((elapsed >= timeout_ms)); then
+        _log warn "timeout: killing command after ${timeout_ms}ms (pid=$cmd_pid, key=$key)"
+        kill "$cmd_pid" 2>/dev/null || true
+        sleep 0.1
+        kill -9 "$cmd_pid" 2>/dev/null || true
+        wait "$cmd_pid" 2>/dev/null || true
+        _unlock_run
+        return 79
+      fi
+      sleep 0.1
+      ((elapsed += check_interval))
+    done
+
+    wait "$cmd_pid" 2>/dev/null
+    rc=$?
+  else
+    "${run_cmd[@]}"
+    rc=$?
+  fi
+
+  _unlock_run
+  return "$rc"
+}
+
+# ---------- decision ----------
+if ! _lock_state_fast; then exit $?; fi
+
+now="$(_now_ms)"
+last="$(_read_or "$ts" "0")"
+pid="$(_read_or "$pend" "")"
+
+runner_alive=0
+if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+  runner_alive=1
+else
+  rm -f "$pend" "$runner_stamp" 2>/dev/null || true
+  pid=""
+fi
+
+active=0
+if ((runner_alive)); then
+  active=1
+else
+  if [[ "$mode" == "throttle" ]]; then
+    ((now < last + delay_ms)) && active=1
+  else
+    [[ "$leading" == "true" ]] && ((now < last + delay_ms)) && active=1
+  fi
+fi
+
+# --no-wait: do not mutate ANY state or cmdfile
+if ((no_wait)) && ((active)); then
+  _unlock_state
+  exit 76
+fi
+
+# Allowed to update stored argv (last-call-wins)
+_write_cmdfile_nul "$cmdfile" "${cmd[@]}"
+
+# If runner exists, update state and exit.
+if ((runner_alive)); then
+  if [[ "$mode" == "debounce" ]]; then
+    [[ "$trailing" == "true" ]] && echo "$((now + delay_ms))" >"$deadline"
+  else
+    [[ "$trailing" == "true" ]] && echo "1" >"$dirty"
+  fi
+  _unlock_state
+  exit 77
+fi
+
+# Become runner: write pending + stamp
+echo "$$" >"$pend"
+_write_runner_stamp "$runner_stamp" "$$"
+_unlock_state
+
+# ---------- runner main ----------
+if [[ "$mode" == "debounce" ]]; then
+  if [[ "$trailing" == "true" ]]; then
+    exec 9>"$state_lock" || _cleanup_pending_and_exit 70
+    flock 9
+    dl="$(_read_or "$deadline" "0")"
+    ((dl <= 0)) && echo "$(($(_now_ms) + delay_ms))" >"$deadline"
+    _unlock_state
+  fi
+
+  if [[ "$leading" == "true" ]]; then
+    now="$(_now_ms)"
+    last="$(_read_or "$ts" "0")"
+    # Leading edge: execute if enough time has passed since last execution (shared across modes)
+    if ((now >= last + delay_ms)); then
+      _exec_once || _cleanup_pending_and_exit $?
+      [[ "$trailing" != "true" ]] && _cleanup_pending_and_exit 0
+
+      exec 9>"$state_lock" || _cleanup_pending_and_exit 70
+      flock 9
+      dl="$(_read_or "$deadline" "0")"
+      if ((dl <= $(_now_ms))); then
+        rm -f "$deadline" 2>/dev/null || true
+        _unlock_state
+        _cleanup_pending_and_exit 0
+      fi
+      _unlock_state
+    fi
+  fi
+
+  if [[ "$trailing" == "true" ]]; then
+    while :; do
+      dl="$(_read_or "$deadline" "0")"
+      now="$(_now_ms)"
+      ((dl <= 0)) && _cleanup_pending_and_exit 0
+
+      if ((now < dl)); then
+        wait_ms=$((dl - now))
+        wait_sec="$(awk "BEGIN { printf \"%.3f\", $wait_ms/1000 }")"
+        sleep "$wait_sec" || true
+        continue
+      fi
+
+      dl2="$(_read_or "$deadline" "0")"
+      now2="$(_now_ms)"
+      ((now2 < dl2)) && continue
+
+      exec 9>"$state_lock" || _cleanup_pending_and_exit 70
+      flock 9
+
+      # Smart skip: if last_exec_ms >= when this deadline was requested,
+      # another mode already satisfied this request — no need to re-execute.
+      # Deadline was set at (dl - delay_ms), so check if exec happened after that.
+      last="$(_read_or "$ts" "0")"
+      request_time=$((dl - delay_ms))
+      if ((last >= request_time)); then
+        _log info "debounce: skipping exec, already satisfied by exec at $last (requested at $request_time)"
+        rm -f "$deadline" 2>/dev/null || true
+        _unlock_state
+        _cleanup_pending_and_exit 0
+      fi
+
+      rm -f "$deadline" 2>/dev/null || true
+      _unlock_state
+
+      _exec_once || _cleanup_pending_and_exit $?
+      _cleanup_pending_and_exit 0
+    done
+  fi
+
+  _cleanup_pending_and_exit 0
+else
+  now="$(_now_ms)"
+  last="$(_read_or "$ts" "0")"
+  cur_end=$((last + delay_ms))
+
+  if [[ "$leading" == "true" ]] && ((now >= cur_end)); then
+    _exec_once || _cleanup_pending_and_exit $?
+  else
+    [[ "$trailing" == "true" ]] && echo "1" >"$dirty"
+    ((last == 0)) && echo "$((now + delay_ms))" >"$window_end"
+  fi
+
+  while :; do
+    we="$(_read_or "$window_end" "0")"
+    now="$(_now_ms)"
+    ((we <= 0)) && _cleanup_pending_and_exit 0
+
+    if ((now < we)); then
+      wait_ms=$((we - now))
+      wait_sec="$(awk "BEGIN { printf \"%.3f\", $wait_ms/1000 }")"
+      sleep "$wait_sec" || true
+      continue
+    fi
+
+    if [[ "$trailing" == "true" ]] && [[ -f "$dirty" ]]; then
+      # Smart skip: check if another mode executed after the dirty flag was set.
+      # The window started at (we - delay_ms), dirty was set sometime after that.
+      # If last_exec_ms >= window_start, the request is already satisfied.
+      last="$(_read_or "$ts" "0")"
+      window_start=$((we - delay_ms))
+      if ((last >= window_start)); then
+        _log info "throttle: skipping trailing exec, already satisfied by exec at $last (window started $window_start)"
+        rm -f "$dirty" 2>/dev/null || true
+        # Don't exit yet — window might get extended; continue loop to check window_end
+        continue
+      fi
+
+      rm -f "$dirty" 2>/dev/null || true
+      _exec_once || _cleanup_pending_and_exit $?
+      continue
+    fi
+
+    _cleanup_pending_and_exit 0
+  done
+fi
