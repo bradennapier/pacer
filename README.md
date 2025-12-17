@@ -49,6 +49,9 @@ Pacer brings battle-tested async patterns to the shell.
 
 > **Inspired by [TanStack Pacer](https://tanstack.com/pacer)** — the excellent async coordination library for JavaScript/TypeScript. This project borrows naming conventions and conceptual patterns from TanStack's work. If you're building JS/TS applications, check out the original.
 
+AI Overview and Examples:
+https://github.com/bradennapier/pacer/blob/copilot/review-utility-features/COMPREHENSIVE_REVIEW.md
+
 ---
 
 ## Features
