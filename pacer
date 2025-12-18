@@ -15,11 +15,14 @@
 # - Last-call-wins argv: each mode tracks its own command; runner executes its mode's latest argv
 # - Ops controls: --status, --reset, --reset-all
 #
-# State dir: /tmp/pacer
+# State dir: /tmp/pacer (configurable via PACER_STATE_DIR)
 # Shared by <id>: run.lock, last_exec_ms
 # Per-mode (mode:id): state.lock, pending_pid, deadline_ms, window_end_ms, dirty, cmd, runner_stamp
 
 set -euo pipefail
+
+# Version
+readonly PACER_VERSION="1.0.1"
 
 # Bash 4.3+ required for nameref (local -n)
 if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3))); then
@@ -113,9 +116,10 @@ _maybe_cleanup() {
 }
 
 _usage() {
+  echo "pacer — single-flight debounce/throttle runner (macOS-friendly)"
+  echo "Version: ${PACER_VERSION}"
+  echo ""
   cat <<'EOF'
-pacer — single-flight debounce/throttle runner (macOS-friendly)
-
 Usage:
   pacer [MODE] [OPTIONS] <id> <delay_ms> <command> [args...]
 
@@ -135,6 +139,7 @@ Options:
   --status [mode id]      Print state for (mode,id). If omitted, prints ALL keys.
   --reset  <mode> <id>    Kill the runner (stamp-verified) and clear state for (mode,id)
   --reset-all <id>        Reset both debounce:<id> and throttle:<id>
+  --version, -v           Show version information
   -h, --help              Show this help
 
 ─────────────────────────────────────────────────────────────────────────────────
@@ -345,14 +350,17 @@ EXIT CODES
 ENVIRONMENT
 ─────────────────────────────────────────────────────────────────────────────────
 
-  PACER_DEBUG=1           Enable debug logging to stderr
-  PACER_LOG_FILE=<path>   Write debug logs to file instead of stderr
+  PACER_DEBUG=1               Enable debug logging to stderr
+  PACER_LOG_FILE=<path>       Write debug logs to file instead of stderr
+  PACER_STATE_DIR=<path>      Override default state directory (default: /tmp/pacer)
+                              Useful for Docker, multi-user systems, or testing
 EOF
 }
 
 # say pacer
 
-_DIR="/tmp/pacer"
+# State directory (configurable via PACER_STATE_DIR environment variable)
+_DIR="${PACER_STATE_DIR:-/tmp/pacer}"
 
 _key_paths() {
   local key="$1"
@@ -649,6 +657,17 @@ _reset_key() {
 }
 
 # ---------- parse ops first ----------
+# Handle version and help flags first
+if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then
+  echo "pacer version ${PACER_VERSION}"
+  exit 0
+fi
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  _usage
+  exit 0
+fi
+
 if [[ "${1:-}" == "--status" ]]; then
   shift
   if [[ $# -eq 0 ]]; then
@@ -695,7 +714,6 @@ while [[ $# -gt 0 ]]; do
     --trailing) trailing="${2:-}"; shift 2 ;;
     --timeout)  timeout_ms="${2:-}"; shift 2 ;;
     --no-wait)  no_wait=1; shift ;;
-    -h|--help)  _usage; exit 0 ;;
     --) shift; break ;;
     -*) echo "Unknown option: $1" >&2; _usage >&2; exit 78 ;;
     *) break ;;
@@ -707,6 +725,12 @@ delay_ms="${2:-}"
 shift 2 2>/dev/null || true
 (($# > 0)) || { _usage >&2; exit 78; }
 [[ -n "$id" && -n "$delay_ms" ]] || { _usage >&2; exit 78; }
+
+# Validate delay_ms is a positive integer greater than 0
+if [[ ! "$delay_ms" =~ ^[0-9]+$ ]] || ((delay_ms == 0)); then
+  echo "pacer: delay_ms must be a positive integer greater than 0 (got: '$delay_ms')" >&2
+  exit 78
+fi
 
 cmd=("$@")
 
@@ -721,7 +745,12 @@ fi
 [[ "$trailing" == "true" || "$trailing" == "false" ]] || { echo "--trailing must be true|false" >&2; exit 78; }
 [[ -z "$timeout_ms" || "$timeout_ms" =~ ^[0-9]+$ ]] || { echo "--timeout must be a positive integer (milliseconds)" >&2; exit 78; }
 
+# Create and validate state directory (security: prevent symlink attacks)
 mkdir -p "$_DIR" || exit 70
+if [[ -L "$_DIR" ]] || [[ ! -d "$_DIR" ]]; then
+  echo "pacer: security error: state directory must be a real directory (not a symlink): $_DIR" >&2
+  exit 70
+fi
 
 # Periodic cleanup (best-effort, non-blocking)
 _maybe_cleanup
