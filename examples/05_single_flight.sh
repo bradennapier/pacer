@@ -73,7 +73,7 @@ LOG_FILE="/tmp/single-flight-demo.log"
 rm -f "$LOG_FILE"
 touch "$LOG_FILE"
 
-# The slow command - simulates a build/migration that takes 2 seconds
+# slow_command simulates a 2-second task that logs start and finish with the provided argument, detects and records if another run appears active by inspecting LOG_FILE, and writes a RUNNING marker while sleeping.
 slow_command() {
     local start_time
     start_time="$(date '+%H:%M:%S.%3N')"

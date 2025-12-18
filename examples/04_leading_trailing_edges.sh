@@ -48,13 +48,13 @@ PACER="${SCRIPT_DIR}/../pacer"
 echo "=== Pacer Example: Leading and Trailing Edge Control ==="
 echo ""
 
-# Helper function
+# demo_exec prints a timestamped execution message with the provided command to stdout.
 demo_exec() {
     echo "    >>> [$(date '+%H:%M:%S.%3N')] EXECUTED: $1"
 }
 export -f demo_exec
 
-# Cleanup function
+# cleanup resets the pacer state for the `demo-edge` target, ignoring errors if the pacER executable is unavailable.
 cleanup() {
     "$PACER" --reset-all demo-edge 2>/dev/null || true
 }

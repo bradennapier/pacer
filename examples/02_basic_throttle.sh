@@ -59,7 +59,7 @@ echo ""
 # Clean up any existing state
 "$PACER" --reset-all demo-throttle 2>/dev/null || true
 
-# Helper function that shows what was received
+# demo_command echoes a timestamped execution message that shows the received argument.
 demo_command() {
     echo "[$(date '+%H:%M:%S.%3N')] >>> EXECUTED with arg: $1"
 }

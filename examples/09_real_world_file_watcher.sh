@@ -64,7 +64,7 @@ touch "$BUILD_LOG"
 # Cleanup
 "$PACER" --reset-all demo-build 2>/dev/null || true
 
-# Simulated build command
+# do_build logs timestamped BUILD STARTED and BUILD COMPLETED entries to BUILD_LOG to simulate a short build run.
 do_build() {
     echo "[$(date '+%H:%M:%S.%3N')] BUILD STARTED" | tee -a "$BUILD_LOG"
     sleep 0.5  # Simulate build time

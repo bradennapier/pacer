@@ -50,7 +50,7 @@ echo ""
 # Clean up any existing state
 "$PACER" --reset-all demo-debounce 2>/dev/null || true
 
-# Helper function that shows what was received
+# demo_command prints a timestamped message showing the single argument it received.
 demo_command() {
     echo "[$(date '+%H:%M:%S.%3N')] Command executed with arg: $1"
 }

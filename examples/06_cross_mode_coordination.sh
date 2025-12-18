@@ -70,7 +70,7 @@ LOG_FILE="/tmp/crossmode-demo.log"
 rm -f "$LOG_FILE"
 touch "$LOG_FILE"
 
-# Track executions
+# log_exec writes a timestamped execution message with the given label to stdout and appends it to the log file.
 log_exec() {
     echo "[$(date '+%H:%M:%S.%3N')] >>> EXECUTED ($1)" | tee -a "$LOG_FILE"
 }

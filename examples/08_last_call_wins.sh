@@ -56,7 +56,7 @@ echo ""
 # Cleanup
 "$PACER" --reset-all demo-lastcall 2>/dev/null || true
 
-# Helper to show what was received
+# show_args prints a timestamped header and then echoes each received argument on its own indented line.
 show_args() {
     echo "[$(date '+%H:%M:%S.%3N')] EXECUTED with args:"
     for arg in "$@"; do
